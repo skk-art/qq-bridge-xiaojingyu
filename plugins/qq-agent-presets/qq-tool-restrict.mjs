@@ -216,6 +216,9 @@ const SAFE_PREFIXES = [
   'mcp__snowluma__',
   'mcp__snowluma-host__',
   'mcp__web-search-safe__',
+  // B站只读 MCP（src/mcp-bilibili.js）：搜索/视频详情/评论/弹幕/相关推荐/榜单。
+  // 全部只读，不登录、不发帖、不评论，放行不扩大本地能力边界。
+  'mcp__bilibili__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

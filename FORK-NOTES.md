@@ -37,6 +37,44 @@
 
 ---
 
+### 4. `src/mcp-bilibili.js` —— B站只读 MCP 服务器（新增）
+
+给 agent 提供 6 个 **B站只读**工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `bili_search_video` | 搜索视频 |
+| `bili_video_info` | 视频详情（BV 号或链接 → 标题/UP/播放/点赞/分P/cid） |
+| `bili_video_comments` | 读评论 |
+| `bili_video_danmaku` | 读弹幕 |
+| `bili_related` | 相关推荐 |
+| `bili_hot` | 综合热门 / 排行榜 / 每周必看 / 热搜词 |
+
+**全部走匿名接口**：不登录、不发帖、不评论、不点赞，不需要任何 Cookie 或账号凭据。
+
+实测要点（2026-10-27）：
+
+- 搜索**必须**走 `/x/web-interface/wbi/search/type` 路径并带 **WBI 签名**
+  —— 旧路径 `/x/web-interface/search/type` 会被风控挡成 HTML。
+- 用户信息、UP主投稿接口需要登录（`-352` 风控 / `412`），本服务器**不提供**。
+- 弹幕走 `/x/v1/dm/list.so`（XML），直接解析 `<d p="...">文本</d>`。
+- 请求显式绕过本机代理（B站是境内站点，直连更快、也更不容易被风控误判）。
+
+**配套改动**：`plugins/qq-agent-presets/qq-tool-restrict.mjs` 的执行期白名单放行
+`mcp__bilibili__` —— 不放行的话桥接会以「工具不在 QQ 桥接白名单内」拒绝调用（实测撞到过）。
+
+**另需本机配置**（不在仓库内）：`~/.dsh/profiles/web/cordis.patch.yml` 里挂一个
+`mcp-bilibili` 条目（`@deepseek-ai/dsh-mcp-client` + stdio + 本文件的绝对路径）。
+
+**测试脚本**（新增）：
+
+- `scripts/test-bilibili-mcp.mjs` —— stdio 直测：握手、列工具、真调工具
+- `scripts/test-bili-dsh-tools.mjs` —— 验证 6 个工具确实进入 DSH 会话的工具面
+- `scripts/test-bili-e2e.mjs` —— 端到端：建 qq-chat-v2 会话，让它真调 B站工具并取回真实数据
+
+> 抖音：本分支**不做**。官方开放平台面向小程序/企业主体，个人没有做互动机器人的路径；
+> 现实可行的只有只读解析视频，意义有限。
+
 ## 未包含的文件（刻意排除）
 
 | 文件 | 原因 |
