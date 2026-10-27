@@ -1,17 +1,22 @@
 // B站（哔哩哔哩）只读 MCP server（stdio）。
 // 由 DSH 的 MCP 客户端 spawn（cordis.patch.yml 里 mcp-bilibili 行）。
 //
-// 全部工具**只读**：搜索、看视频信息、读评论、读弹幕、看相关推荐、看热门/排行/热搜。
-// 不登录、不发帖、不评论、不点赞——不需要任何 Cookie 或账号凭据。
+// 全部工具**只读**：搜索、看视频信息、读评论、读弹幕、看相关推荐、看热门/排行/热搜，
+// 以及登录后可见的 UP主资料/投稿、我的信息/关注/动态/稍后再看/观看历史。
+// **不写任何东西**：不发帖、不评论、不发弹幕、不点赞、不关注。
 //
-// 接口可用性（2026-10-27 实测，匿名）：
+// 匿名可用（2026-10-27 实测）：
 //   ✅ 视频信息 view / 热门 popular / 排行榜 ranking / 每周必看 / 热搜 square / 相关推荐 related
 //   ✅ 搜索  —— 必须走 wbi 路径并带 WBI 签名（旧路径 /x/web-interface/search/type 会被风控挡成 HTML）
 //   ✅ 评论 reply / 弹幕 dm
-//   ❌ 用户信息、UP主投稿 —— 需要登录（-352 风控 / 412），本服务器不提供
+// 需要登录（config.json 的 bilibili.sessdata）：
+//   UP主资料、UP主投稿、我的信息、我的关注、我的动态、稍后再看、观看历史
 //
 // 所有网络请求均直连 api.bilibili.com（显式绕过本机代理）。
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
@@ -29,6 +34,36 @@ const BASE_H = {
   'Accept-Language': 'zh-CN,zh;q=0.9',
 };
 const TIMEOUT_MS = 15000;
+
+// ── 凭据：从 <repo>/config.json 的 bilibili 段读取（该文件被 .gitignore 排除，不会入库）──────
+//   { "bilibili": { "sessdata": "…", "biliJct": "…", "buvid3": "…" } }
+// 只有需要登录的只读工具会用到；匿名工具不受影响。
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+function readCreds() {
+  try {
+    let text = fs.readFileSync(path.join(ROOT, 'config.json'), 'utf8');
+    if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+    const b = JSON.parse(text)?.bilibili ?? {};
+    return {
+      sessdata: String(b.sessdata ?? '').trim(),
+      biliJct: String(b.biliJct ?? '').trim(),
+      buvid3: String(b.buvid3 ?? '').trim(),
+    };
+  } catch {
+    return { sessdata: '', biliJct: '', buvid3: '' };
+  }
+}
+function hasLogin() {
+  return readCreds().sessdata.length > 0;
+}
+function requireLogin() {
+  if (!hasLogin()) {
+    throw new Error(
+      '这个工具需要登录 B站。请在 E:\\qq-bridge\\config.json 里填 "bilibili": { "sessdata": "你的 SESSDATA" }，' +
+      '然后重启 DSH 让 MCP 服务器重新读取配置。'
+    );
+  }
+}
 
 // ── WBI 签名 ────────────────────────────────────────────────────────────────
 const MIXIN_TAB = [
@@ -60,12 +95,21 @@ async function rawFetch(url, headers) {
 
 async function getSession(force = false) {
   if (!force && session && Date.now() - sessionAt < SESSION_TTL_MS) return session;
+  const creds = readCreds();
   const spi = await (await rawFetch('https://api.bilibili.com/x/frontend/finger/spi', BASE_H)).json();
-  const cookie = `buvid3=${spi.data.b_3}; buvid4=${spi.data.b_4}; b_nut=${Math.round(Date.now() / 1000)}`;
+  const parts = [
+    `buvid3=${creds.buvid3 || spi.data.b_3}`,
+    `buvid4=${spi.data.b_4}`,
+    `b_nut=${Math.round(Date.now() / 1000)}`,
+  ];
+  // 登录态：有 SESSDATA 时带上，登录可见的接口才拿得到数据。
+  if (creds.sessdata) parts.push(`SESSDATA=${creds.sessdata}`);
+  if (creds.biliJct) parts.push(`bili_jct=${creds.biliJct}`);
+  const cookie = parts.join('; ');
   const nav = await (await rawFetch('https://api.bilibili.com/x/web-interface/nav', { ...BASE_H, Cookie: cookie })).json();
   const imgKey = nav.data.wbi_img.img_url.split('/').pop().split('.')[0];
   const subKey = nav.data.wbi_img.sub_url.split('/').pop().split('.')[0];
-  session = { cookie, imgKey, subKey };
+  session = { cookie, imgKey, subKey, loggedIn: nav.data.isLogin === true };
   sessionAt = Date.now();
   return session;
 }
@@ -262,6 +306,154 @@ server.tool(
       }
       const d = await biliGet('/x/web-interface/search/square', { limit: n });
       return ok({ type, list: (d?.trending?.list ?? []).slice(0, n).map((x) => ({ keyword: x.keyword, show_name: x.show_name })) });
+    } catch (e) { return fail(e); }
+  }
+);
+
+// ── 以下工具需要登录（config.json 的 bilibili.sessdata）──────────────────────
+
+server.tool(
+  'bili_me',
+  '查看当前登录的 B站账号信息：昵称、UID、等级、硬币、会员状态。需要已配置 SESSDATA。只读。',
+  {},
+  async () => {
+    try {
+      requireLogin();
+      const s = await getSession(true);
+      if (!s.loggedIn) return fail(new Error('SESSDATA 无效或已过期（B站返回未登录）。请重新获取 SESSDATA。'));
+      const nav = await (await rawFetch('https://api.bilibili.com/x/web-interface/nav', { ...BASE_H, Cookie: s.cookie })).json();
+      const d = nav.data ?? {};
+      return ok({
+        mid: d.mid, name: d.uname,
+        level: d.level_info?.current_level,
+        coins: d.money, vip: d.vipStatus === 1,
+        vipType: d.vipType,
+        url: d.mid ? `https://space.bilibili.com/${d.mid}` : null,
+      });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_user_info',
+  '查看某个 UP主 的公开资料：昵称、签名、粉丝数、关注数、投稿数、等级、认证信息。需要登录（B站风控要求）。只读。',
+  { mid: z.string().describe('UP主的 UID（数字）') },
+  async ({ mid }) => {
+    try {
+      requireLogin();
+      const d = await biliGet('/x/space/wbi/acc/info', { mid }, { wbi: true });
+      return ok({
+        mid: d.mid, name: d.name, sign: d.sign,
+        level: d.level, sex: d.sex,
+        fans: d.follower ?? d.fans, following: d.following,
+        archiveCount: d.archive_count,
+        official: d.official?.title ?? null,
+        vip: d.vip?.label?.text ?? null,
+        url: `https://space.bilibili.com/${d.mid}`,
+      });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_user_videos',
+  '查看某个 UP主 的投稿视频列表（按发布时间倒序）。需要登录（B站风控要求）。只读。',
+  {
+    mid: z.string().describe('UP主的 UID（数字）'),
+    page: z.number().int().min(1).max(30).optional().describe('页码，默认 1'),
+    limit: z.number().int().min(1).max(50).optional().describe('条数上限，默认 10'),
+  },
+  async ({ mid, page, limit }) => {
+    try {
+      requireLogin();
+      const d = await biliGet('/x/space/wbi/arc/search',
+        { mid, ps: 30, pn: page ?? 1, order: 'pubdate', platform: 'web' }, { wbi: true });
+      const list = (d?.list?.vlist ?? []).slice(0, limit ?? 10).map((v) => ({
+        bvid: v.bvid, title: v.title, play: v.play, danmaku: v.video_review,
+        length: v.length, created: v.created ? new Date(v.created * 1000).toISOString().slice(0, 10) : null,
+        url: `https://www.bilibili.com/video/${v.bvid}`,
+      }));
+      return ok({ mid, total: d?.page?.count ?? null, page: page ?? 1, count: list.length, videos: list });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_my_following',
+  '查看当前登录账号的关注列表（我关注了谁）。需要已配置 SESSDATA。只读。',
+  {
+    page: z.number().int().min(1).max(50).optional().describe('页码，默认 1'),
+    limit: z.number().int().min(1).max(50).optional().describe('条数上限，默认 20'),
+  },
+  async ({ page, limit }) => {
+    try {
+      requireLogin();
+      const s = await getSession();
+      const nav = await (await rawFetch('https://api.bilibili.com/x/web-interface/nav', { ...BASE_H, Cookie: s.cookie })).json();
+      const myMid = nav.data?.mid;
+      if (!myMid) return fail(new Error('拿不到自己的 UID，SESSDATA 可能已失效'));
+      const d = await biliGet('/x/relation/followings', { vmid: myMid, ps: 50, pn: page ?? 1 });
+      const list = (d?.list ?? []).slice(0, limit ?? 20).map((u) => ({
+        mid: u.mid, name: u.uname, sign: u.sign,
+        url: `https://space.bilibili.com/${u.mid}`,
+      }));
+      return ok({ total: d?.total ?? null, page: page ?? 1, count: list.length, following: list });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_my_dynamics',
+  '查看当前登录账号首页的动态流（关注的人发了什么）。需要已配置 SESSDATA。只读。',
+  { limit: z.number().int().min(1).max(30).optional().describe('条数上限，默认 10') },
+  async ({ limit }) => {
+    try {
+      requireLogin();
+      const d = await biliGet('/x/polymer/web-dynamic/v1/feed/all', { type: 'all', page: 1 });
+      const items = (d?.items ?? []).slice(0, limit ?? 10).map((it) => ({
+        id: it.id_str,
+        author: it.modules?.module_author?.name,
+        type: it.type,
+        text: String(it.modules?.module_dynamic?.desc?.text ?? it.modules?.module_dynamic?.major?.archive?.title ?? '').slice(0, 200),
+        time: it.modules?.module_author?.pub_time,
+      }));
+      return ok({ count: items.length, hasMore: d?.has_more === true, dynamics: items });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_toview',
+  '查看当前登录账号的「稍后再看」列表。需要已配置 SESSDATA。只读。',
+  { limit: z.number().int().min(1).max(50).optional().describe('条数上限，默认 20') },
+  async ({ limit }) => {
+    try {
+      requireLogin();
+      const d = await biliGet('/x/v2/history/toview', {});
+      const list = (d?.list ?? []).slice(0, limit ?? 20).map((v) => ({
+        bvid: v.bvid, title: v.title, author: v.owner?.name, duration: v.duration,
+        progress: v.progress, addAt: v.add_at ? new Date(v.add_at * 1000).toISOString() : null,
+        url: `https://www.bilibili.com/video/${v.bvid}`,
+      }));
+      return ok({ count: list.length, toview: list });
+    } catch (e) { return fail(e); }
+  }
+);
+
+server.tool(
+  'bili_my_history',
+  '查看当前登录账号的观看历史。需要已配置 SESSDATA。只读。',
+  { limit: z.number().int().min(1).max(50).optional().describe('条数上限，默认 20') },
+  async ({ limit }) => {
+    try {
+      requireLogin();
+      const d = await biliGet('/x/v2/history', { ps: 30, pn: 1 });
+      const list = (d?.list ?? []).slice(0, limit ?? 20).map((v) => ({
+        bvid: v.bvid ?? v.history?.bvid, title: v.title, author: v.owner?.name,
+        progress: v.progress, viewAt: v.view_at ? new Date(v.view_at * 1000).toISOString() : null,
+        url: v.bvid ? `https://www.bilibili.com/video/${v.bvid}` : null,
+      }));
+      return ok({ count: list.length, history: list });
     } catch (e) { return fail(e); }
   }
 );

@@ -68,6 +68,31 @@ const SOCIAL_V2_FILE = path.join(STATE_DIR, 'social-v2.json');
 const INITIAL_PROMPTS_FILE = path.join(STATE_DIR, 'initial-prompts.json');
 const STICKER_FILE = path.join(STATE_DIR, 'stickers.json');
 const FEEDBACK_FILE = path.join(STATE_DIR, 'feedback.json');
+
+// ── 虚拟形象（avatar UI）事件总线（模块级）────────────────────────────────────
+//
+// 放在模块级而不是 main() 里：消息入库（message.in）与投递（turn.start）这两个
+// 事件点在 main() 之外，放在 main() 内会 ReferenceError（实测踩到）。
+//
+// 用途：给外部的「虚拟形象 UI」（Live2D / VRM / 网页形象）提供实时事件流，
+// 让它跟着机器人做表情、动嘴、显示状态。对外接口：GET /api/avatar/events（SSE）。
+// 事件格式与反向控制接口见仓库根目录 AVATAR-API.md。
+//
+// 约束：只读广播（UI 不参与决策）；零依赖（Node 内置 http 的 SSE）；
+//       失败隔离（写失败只摘掉该订阅者，绝不影响主流程）；心跳定时器 unref。
+const avatarClients = new Set();
+let avatarSeq = 0;
+let avatarSnapshotProvider = () => ({});
+function avatarEmit(type, data = {}) {
+  const ev = { seq: ++avatarSeq, ts: Date.now(), type, data };
+  if (avatarClients.size === 0) return ev; // 没人订阅就不做序列化开销
+  const line = `data: ${JSON.stringify(ev)}\n\n`;
+  for (const client of [...avatarClients]) {
+    try { client.res.write(line); } catch { avatarClients.delete(client); }
+  }
+  return ev;
+}
+
 const TOOL_LOG_FILE = path.join(STATE_DIR, 'tool-calls.jsonl');
 const TOKEN_USAGE_FILE = path.join(STATE_DIR, 'token-usage.jsonl');
 const ACTIVITY_LOG = path.join(STATE_DIR, 'qq-activity.log');
@@ -3164,6 +3189,16 @@ async function main() {
     };
     // 二代会话工具必须仍命中当前模式的白名单/准入；避免白名单移除后旧 agentToken 继续读状态。
     const v2SessionAllowed = isSessionAllowedInCurrentMode;
+    function avatarSnapshot() {
+      return {
+        mode: currentMode,
+        paused: socialV2?.paused === true,
+        conversations: Object.keys(state.sessions ?? {}),
+        presets: { chat: cfg.agentPreset ?? null, socialV2: cfg.socialV2?.agentPreset ?? null },
+      };
+    }
+    avatarSnapshotProvider = avatarSnapshot;
+
     const server = http.createServer(async (req, res) => {
       let url;
       try { url = new URL(req.url ?? '/', `http://127.0.0.1:${port}`); }
@@ -3335,6 +3370,34 @@ async function main() {
         }
       }
       try {
+        // ── 虚拟形象 UI：SSE 事件流（仅控制台/管理端）─────────────────────
+        // 见仓库根 AVATAR-API.md。GET /api/avatar/events?token=<控制台令牌>
+        if (url.pathname === '/api/avatar/events') {
+          if (req.method !== 'GET') { sendJson({ ok: false, error: '该接口仅支持 GET' }, 405); return; }
+          if (req.headers['x-agent-call'] !== undefined || req.headers['x-agent-token']) {
+            sendJson({ ok: false, error: '该接口仅控制台可用' }, 403); return;
+          }
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream; charset=utf-8',
+            'Cache-Control': 'no-store',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+          });
+          res.write(': avatar-events connected\n\n');
+          const client = { res, at: Date.now() };
+          avatarClients.add(client);
+          try {
+            res.write(`data: ${JSON.stringify({ seq: ++avatarSeq, ts: Date.now(), type: 'hello', data: avatarSnapshotProvider() })}\n\n`);
+          } catch { avatarClients.delete(client); }
+          const hb = setInterval(() => {
+            try { res.write(': hb\n\n'); } catch { clearInterval(hb); avatarClients.delete(client); }
+          }, 25000);
+          hb.unref?.();
+          req.on('close', () => { clearInterval(hb); avatarClients.delete(client); });
+          return;
+        }
+
+
         // 空 agent token 一律拒绝，防止 MCP 传入空字符串时被当作“管理端/无 token”绕过校验
         if (req.headers['x-agent-token'] === '') {
           sendJson({ ok: false, error: 'agent token 不能为空' }, 403);
@@ -5321,6 +5384,7 @@ async function main() {
             st.wakeConfig.noActionCount = 0;
             saveSocialV2State();
             log(`[reserved2] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${messages.length} 条`);
+            avatarEmit('reply.out', { key, segments: (sentMessages ?? []).map((m) => (typeof m === 'string' ? m : (m?.text ?? ''))).filter(Boolean) });
             appendActivity(`${key} [reserved2] 工具统一发送：成功 ${sentMessages.length}/${messages.length} 条`);
             if (sentMessages.length > 0) scheduleReplyCheckV2(key);
             const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
@@ -5819,6 +5883,7 @@ async function main() {
             saveSocialV2State();
             scheduleReplyCheckV2(key);
             log(`[sticker] 工具发送表情 ${key}: ${sent.entry?.id || stickerId}`);
+            avatarEmit('sticker.out', { key, stickerId: sent.entry?.id || stickerId, label });
             appendActivity(`${key} [sticker] 工具发送表情：${label}`);
             sendJson({ ok: true, key, sticker: sent.entry, sent: 1, failed: 0, quoted: quotedInfo });
           } catch (error) {
@@ -10997,6 +11062,7 @@ async function main() {
         }
       }
       appendActivity(`${key} [reserved2] 消息已入未读：${textContent.slice(0, 80)}`);
+      avatarEmit('message.in', { key, from: kind === 'group' ? 'group' : 'private', text: String(textContent ?? '').slice(0, 500) });
       return;
     }
 
@@ -11149,6 +11215,7 @@ async function main() {
     }
     if (cfg.ackMessage && currentMode !== 'reserved2') await sendToQQ(key, cfg.ackMessage);
     log(`已投递 ${key}: ${promptText.slice(0, 80)}${promptText.length > 80 ? '…' : ''}`);
+    avatarEmit('turn.start', { key, reason: 'delivered' });
   }
 
   // 取消/拒绝一个挂起的提问或审批，并给 DSH 回执（超时、被新请求覆盖时使用）

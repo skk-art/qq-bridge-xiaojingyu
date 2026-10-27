@@ -75,6 +75,45 @@
 > 抖音：本分支**不做**。官方开放平台面向小程序/企业主体，个人没有做互动机器人的路径；
 > 现实可行的只有只读解析视频，意义有限。
 
+### 5. `src/mcp-bilibili.js` —— 登录只读工具（新增 7 个）
+
+在上面 6 个匿名工具之外，再加 7 个**需要登录**的只读工具：
+
+| 工具 | 作用 |
+| --- | --- |
+| `bili_me` | 当前登录账号信息（昵称/UID/等级/硬币/会员） |
+| `bili_user_info` | UP主公开资料（粉丝数/投稿数/认证） |
+| `bili_user_videos` | UP主投稿列表 |
+| `bili_my_following` | 我的关注列表 |
+| `bili_my_dynamics` | 首页动态流 |
+| `bili_toview` | 稍后再看 |
+| `bili_my_history` | 观看历史 |
+
+凭据从 `config.json` 的 `bilibili` 段读（该文件被 `.gitignore` 排除，不会入库）：
+
+```jsonc
+{ "bilibili": { "sessdata": "你的 SESSDATA", "biliJct": "", "buvid3": "" } }
+```
+
+未配置时这些工具会返回可操作的提示，不会静默失败。**仍然全是只读**：
+不发帖、不评论、不发弹幕、不点赞、不关注。
+
+### 6. `AVATAR-API.md` + `src/bridge.js` 的虚拟形象事件流（新增）
+
+给外部的「虚拟形象 UI」（Live2D / VRM / 网页形象）用的实时接口：
+
+- **观察**：`GET /api/avatar/events`（SSE）广播 `hello` / `message.in` /
+  `turn.start` / `reply.out` / `sticker.out` 五类事件，`reply.out` 带**分好条的**文本数组，
+  适合逐条驱动口型与气泡。
+- **控制**：沿用已有的 `POST /api/send/*`（以机器人身份直接发）与
+  `POST /api/console/notify-ai`（塞进上下文，走完整人设与安全链路）。
+
+完整字段说明与最小可用示例见 `AVATAR-API.md`。
+
+> ⚠️ **实现注意**：事件总线放在**模块级**而不是 `main()` 里。消息入库（`message.in`）
+> 与投递（`turn.start`）这两个事件点在 `main()` 之外，放在 `main()` 内会
+> `ReferenceError: avatarEmit is not defined`（实测踩到并已修）。改这块时别把它挪回 `main()`。
+
 ## 未包含的文件（刻意排除）
 
 | 文件 | 原因 |
