@@ -94,8 +94,9 @@ async function rawFetch(url, headers) {
 }
 
 async function getSession(force = false) {
-  if (!force && session && Date.now() - sessionAt < SESSION_TTL_MS) return session;
   const creds = readCreds();
+  // 凭据变了（比如刚填上 SESSDATA）就重建会话，免得用户改完 config.json 还得重启 DSH。
+  if (!force && session && session.sessdata === creds.sessdata && Date.now() - sessionAt < SESSION_TTL_MS) return session;
   const spi = await (await rawFetch('https://api.bilibili.com/x/frontend/finger/spi', BASE_H)).json();
   const parts = [
     `buvid3=${creds.buvid3 || spi.data.b_3}`,
@@ -109,7 +110,7 @@ async function getSession(force = false) {
   const nav = await (await rawFetch('https://api.bilibili.com/x/web-interface/nav', { ...BASE_H, Cookie: cookie })).json();
   const imgKey = nav.data.wbi_img.img_url.split('/').pop().split('.')[0];
   const subKey = nav.data.wbi_img.sub_url.split('/').pop().split('.')[0];
-  session = { cookie, imgKey, subKey, loggedIn: nav.data.isLogin === true };
+  session = { cookie, imgKey, subKey, loggedIn: nav.data.isLogin === true, sessdata: creds.sessdata };
   sessionAt = Date.now();
   return session;
 }
@@ -448,7 +449,10 @@ server.tool(
     try {
       requireLogin();
       const d = await biliGet('/x/v2/history', { ps: 30, pn: 1 });
-      const list = (d?.list ?? []).slice(0, limit ?? 20).map((v) => ({
+      // 注意：这个接口的 data 直接就是数组，不是 { list: [...] }（实测 2026-10-27）。
+      // 两种形状都兼容，免得哪天 B站又改回去。
+      const raw = Array.isArray(d) ? d : (d?.list ?? []);
+      const list = raw.slice(0, limit ?? 20).map((v) => ({
         bvid: v.bvid ?? v.history?.bvid, title: v.title, author: v.owner?.name,
         progress: v.progress, viewAt: v.view_at ? new Date(v.view_at * 1000).toISOString() : null,
         url: v.bvid ? `https://www.bilibili.com/video/${v.bvid}` : null,
